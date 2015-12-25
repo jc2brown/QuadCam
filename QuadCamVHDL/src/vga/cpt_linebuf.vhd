@@ -1,0 +1,443 @@
+----------------------------------------------------------------------------------
+-- Author: Mark Mahony
+-- Designer: Chris Brown
+-- 
+-- Create Date:		12:47:03 07/07/2015
+-- Module Name:		cpt_linebuf
+-- Project Name:	ESE Capstone 2015
+-- Target Devices:	Xilinx Spartan-6
+-- Tool versions:	XISE 14.7
+-- Description:		Component to buffer data read from RAM.
+--
+-- Dependencies: Xilinx primitives, mctl and util libraries
+----------------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all; 
+
+library unisim;
+use unisim.vcomponents.all;
+
+library mctl;
+use mctl.pkg_mctl.all;
+
+library util;
+use util.pkg_util.all;
+
+
+entity cpt_linebuf is
+	port (
+		i_clk : in std_logic;
+		i_enable : in std_logic;
+		
+		i_frame_addr0 : in std_logic_vector(28 downto 0);
+		i_frame_addr1 : in std_logic_vector(28 downto 0);
+		i_frame_addr2 : in std_logic_vector(28 downto 0);
+		i_frame_addr3 : in std_logic_vector(28 downto 0);
+		i_frame_number : in integer range 0 to 3 := 0;
+		
+		i_line_start : in std_logic;
+		i_mid_line_offset : in integer range -(2**24) to (2**24)-1 := 0;
+		i_line_number : in integer range -1024 to 1023 := -408;
+		
+		i_burst_length : in std_logic_vector(5 downto 0);
+		i_pixel_number : in integer range -2048 to 2047;
+		
+		i_mport_mosi : in typ_mctl_mport_mosi;
+		o_mport_miso : out typ_mctl_mport_miso;
+		
+		o_linebuf_data : out std_logic_vector(15 downto 0)
+	);
+end cpt_linebuf;
+
+architecture Behavioral of cpt_linebuf is
+
+	-- Linebuffer signals
+	signal linebuf_wr_addr : integer range 0 to (2**11)-1;
+	signal linebuf_wr_data : std_logic_vector (15 downto 0);
+	signal linebuf_wr_en : std_logic;
+
+	-- Frame signals
+	signal f_addr : std_logic_vector (28 downto 0);
+	--signal mid_line_offset : integer range -(2**29) to (2**29)-1;
+
+	-- MISO READ
+	signal mport_miso_rd_en : std_logic;
+	signal mport_miso_rd_en_d1 : std_logic;
+
+	-- MISO COMMAND
+	signal mport_miso_cmd_en : std_logic;
+	signal mport_miso_cmd_byte_addr : integer range 0 to (2**29)-1 := 0;
+
+	-- MOSI READ
+	signal mport_mosi_rd_empty : std_logic;
+	signal mport_mosi_rd_data : std_logic_vector (31 downto 0);
+
+	-- MOSI COMMAND
+	signal mport_mosi_cmd_full : std_logic;
+
+	signal words_requested : integer range 0 to (2**10)-1;
+	signal words_fetched : integer range 0 to (2**10)-1;
+
+
+
+	signal byte_addr_line_number : integer range 0 to 2**29-1;
+	signal byte_addr_f_addr : integer range 0 to 2**29-1;
+	signal byte_addr_mid_line_offset : integer range 0 to 2**29-1;
+	signal byte_addr_words_requested : integer range 0 to 2**29-1;
+	signal byte_addr_words_requested_offset : integer range 0 to 2**29-1;
+	
+	
+begin
+
+words_requested_counter : cpt_upcounter
+	port map (
+		i_clk => i_clk,
+		i_preset => '0',
+		i_enable => mport_miso_cmd_en,
+		i_clear => i_line_start,
+		i_lowest => 0,
+		i_highest => 1023,
+		i_increment => to_integer(unsigned(i_burst_length))+1,
+		o_count => words_requested,
+		o_carry => open
+	);
+
+words_fetched_counter : cpt_upcounter
+	port map (
+		i_clk => i_clk,
+		i_preset => '0',
+		i_enable => mport_miso_rd_en,
+		i_clear => i_line_start,
+		i_lowest => 0,
+		i_highest => 1023,
+		i_increment => 1,
+		o_count => words_fetched,
+		o_carry => open
+	);
+
+pixel_counter : cpt_upcounter
+	port map (
+		i_clk => i_clk,
+		i_preset => '0',
+		i_enable => linebuf_wr_en,
+		i_clear => i_line_start,
+		i_lowest => 0,
+		i_highest => 2047,
+		i_increment => 1,
+		o_count => linebuf_wr_addr,
+		o_carry => open
+	);
+
+linebuf_upper_ramb8 : RAMB16_S9_S9
+   generic map (
+      INIT_A => X"000", --  Value of output RAM registers on Port A at startup
+      INIT_B => X"000", --  Value of output RAM registers on Port B at startup
+      SRVAL_A => X"000", --  Port A output value upon SSR assertion
+      SRVAL_B => X"000", --  Port B output value upon SSR assertion
+      WRITE_MODE_A => "WRITE_FIRST", --  WRITE_FIRST, READ_FIRST or NO_CHANGE
+      WRITE_MODE_B => "WRITE_FIRST", --  WRITE_FIRST, READ_FIRST or NO_CHANGE
+      SIM_COLLISION_CHECK => "ALL", -- "NONE", "WARNING", "GENERATE_X_ONLY", "ALL" 
+      -- The following INIT_xx declarations specify the initial contents of the RAM
+      -- Address 0 to 511
+      INIT_00 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_01 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_02 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_03 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_04 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_05 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_06 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_07 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_08 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_09 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0A => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0B => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0C => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0D => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0E => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0F => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 512 to 1023
+      INIT_10 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_11 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_12 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_13 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_14 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_15 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_16 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_17 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_18 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_19 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1A => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1B => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1C => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1D => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1E => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1F => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 1024 to 1535
+      INIT_20 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_21 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_22 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_23 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_24 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_25 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_26 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_27 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_28 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_29 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2A => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2B => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2C => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2D => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2E => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2F => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 1536 to 2047
+      INIT_30 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_31 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_32 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_33 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_34 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_35 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_36 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_37 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_38 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_39 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3A => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3B => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3C => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3D => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3E => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3F => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- The next set of INITP_xx are for the parity bits
+      -- Address 0 to 511
+      INITP_00 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INITP_01 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 512 to 1023
+      INITP_02 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INITP_03 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 1024 to 1535
+      INITP_04 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INITP_05 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 1536 to 2047
+      INITP_06 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INITP_07 => X"0000000000000000000000000000000000000000000000000000000000000000")
+   port map (
+      DOA => open,      -- Port A 8-bit Data Output
+      DOB => o_linebuf_data(15 downto 8),      -- Port B 8-bit Data Output
+      DOPA => open,    -- Port A 1-bit Parity Output
+      DOPB => open,    -- Port B 1-bit Parity Output
+      ADDRA => std_logic_vector(to_unsigned(linebuf_wr_addr mod 2048, 11)),  -- Port A 11-bit Address Input
+      ADDRB => std_logic_vector(to_unsigned(i_pixel_number mod 2048, 11)),  -- Port B 11-bit Address Input
+      CLKA => i_clk,    -- Port A Clock
+      CLKB => i_clk,    -- Port B Clock
+      DIA => linebuf_wr_data(15 downto 8),      -- Port A 8-bit Data Input
+      DIB => (others => '0'),      -- Port B 8-bit Data Input
+      DIPA => (others => '0'),    -- Port A 1-bit parity Input
+      DIPB => (others => '0'),    -- Port-B 1-bit parity Input
+      ENA => '1',      -- Port A RAM Enable Input
+      ENB => '1',      -- PortB RAM Enable Input
+      SSRA => '0',    -- Port A Synchronous Set/Reset Input
+      SSRB => '0',    -- Port B Synchronous Set/Reset Input
+      WEA => linebuf_wr_en,      -- Port A Write Enable Input
+      WEB => '0'       -- Port B Write Enable Input
+   );
+
+linebuf_lower_ramb8 : RAMB16_S9_S9
+   generic map (
+      INIT_A => X"000", --  Value of output RAM registers on Port A at startup
+      INIT_B => X"000", --  Value of output RAM registers on Port B at startup
+      SRVAL_A => X"000", --  Port A output value upon SSR assertion
+      SRVAL_B => X"000", --  Port B output value upon SSR assertion
+      WRITE_MODE_A => "WRITE_FIRST", --  WRITE_FIRST, READ_FIRST or NO_CHANGE
+      WRITE_MODE_B => "WRITE_FIRST", --  WRITE_FIRST, READ_FIRST or NO_CHANGE
+      SIM_COLLISION_CHECK => "ALL", -- "NONE", "WARNING", "GENERATE_X_ONLY", "ALL" 
+      -- The following INIT_xx declarations specify the initial contents of the RAM
+      -- Address 0 to 511
+      INIT_00 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_01 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_02 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_03 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_04 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_05 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_06 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_07 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_08 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_09 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0A => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0B => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0C => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0D => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0E => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_0F => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 512 to 1023
+      INIT_10 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_11 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_12 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_13 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_14 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_15 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_16 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_17 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_18 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_19 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1A => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1B => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1C => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1D => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1E => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_1F => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 1024 to 1535
+      INIT_20 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_21 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_22 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_23 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_24 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_25 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_26 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_27 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_28 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_29 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2A => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2B => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2C => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2D => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2E => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_2F => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 1536 to 2047
+      INIT_30 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_31 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_32 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_33 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_34 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_35 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_36 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_37 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_38 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_39 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3A => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3B => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3C => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3D => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3E => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INIT_3F => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- The next set of INITP_xx are for the parity bits
+      -- Address 0 to 511
+      INITP_00 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INITP_01 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 512 to 1023
+      INITP_02 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INITP_03 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 1024 to 1535
+      INITP_04 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INITP_05 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      -- Address 1536 to 2047
+      INITP_06 => X"0000000000000000000000000000000000000000000000000000000000000000",
+      INITP_07 => X"0000000000000000000000000000000000000000000000000000000000000000")
+   port map (
+      DOA => open,      -- Port A 8-bit Data Output
+      DOB => o_linebuf_data(7 downto 0),      -- Port B 8-bit Data Output
+      DOPA => open,    -- Port A 1-bit Parity Output
+      DOPB => open,    -- Port B 1-bit Parity Output
+      ADDRA => std_logic_vector(to_unsigned(linebuf_wr_addr mod 2048, 11)),  -- Port A 11-bit Address Input
+      ADDRB => std_logic_vector(to_unsigned(i_pixel_number mod 2048, 11)),  -- Port B 11-bit Address Input
+      CLKA => i_clk,    -- Port A Clock
+      CLKB => i_clk,    -- Port B Clock
+      DIA => linebuf_wr_data(7 downto 0),      -- Port A 8-bit Data Input
+      DIB => (others => '0'),      -- Port B 8-bit Data Input
+      DIPA => (others => '0'),    -- Port A 1-bit parity Input
+      DIPB => (others => '0'),    -- Port-B 1-bit parity Input
+      ENA => '1',      -- Port A RAM Enable Input
+      ENB => '1',      -- PortB RAM Enable Input
+      SSRA => '0',    -- Port A Synchronous Set/Reset Input
+      SSRB => '0',    -- Port B Synchronous Set/Reset Input
+      WEA => linebuf_wr_en,      -- Port A Write Enable Input
+      WEB => '0'       -- Port B Write Enable Input
+   );
+
+inst : FD
+	port map (
+		D => mport_miso_rd_en,
+		C => i_clk,
+		Q => mport_miso_rd_en_d1
+	);
+
+	-- Input & Output
+	o_mport_miso.wr.clk <= i_clk;
+	o_mport_miso.wr.en <= '0';
+	o_mport_miso.wr.mask <= "1111";
+	o_mport_miso.wr.data <= (others => '0');
+
+	o_mport_miso.cmd.instr <= "011";	-- Read mode with auto-precharge
+	o_mport_miso.cmd.clk <= i_clk;
+	o_mport_miso.cmd.en <= mport_miso_cmd_en;
+	o_mport_miso.cmd.bl <= i_burst_length;
+
+	o_mport_miso.rd.clk <= i_clk;
+	o_mport_miso.rd.en <= mport_miso_rd_en;
+
+	mport_mosi_cmd_full <= i_mport_mosi.cmd.full;
+	mport_mosi_rd_empty <= i_mport_mosi.rd.empty;
+	mport_mosi_rd_data <= i_mport_mosi.rd.data;
+
+	
+	
+	byte_addr_line_number <= (i_line_number * 2048);
+	byte_addr_f_addr <= to_integer(unsigned(f_addr));
+	byte_addr_mid_line_offset <= (i_mid_line_offset * 2048);
+	byte_addr_words_requested <= (words_requested * 4);
+	byte_addr_words_requested_offset <= ((words_requested-320) * 4);
+
+
+
+	-- Address generation
+	mport_miso_cmd_byte_addr <= 
+		(
+			byte_addr_line_number + 
+			byte_addr_f_addr + 
+			byte_addr_mid_line_offset + 
+			byte_addr_words_requested_offset
+		) mod (2**29)	
+	when (words_requested >= 320)	else 
+		(
+			byte_addr_line_number +
+			byte_addr_f_addr + 
+			byte_addr_words_requested
+		) mod (2**29);
+	
+	o_mport_miso.cmd.byte_addr <= std_logic_vector(to_unsigned(mport_miso_cmd_byte_addr, o_mport_miso.cmd.byte_addr'length));
+	--mid_line_offset <= (i_mid_line_offset) when (words_requested >= 320) else 0;
+
+	-- Counter enable
+	mport_miso_cmd_en <= '1' when (i_line_start = '0') and 
+						(mport_mosi_cmd_full = '0') and 
+						(words_requested < 640) and 
+						(64-((words_requested - words_fetched)) > to_integer(unsigned(i_burst_length))+1)
+						--((words_requested - words_fetched) <= to_integer(unsigned(i_burst_length))+1)
+				else '0';
+
+	-- Data path
+	mport_miso_rd_en <= (not mport_mosi_rd_empty) and (not mport_miso_rd_en_d1);
+	linebuf_wr_en <= mport_miso_rd_en or mport_miso_rd_en_d1;
+	linebuf_wr_data <= mport_mosi_rd_data(15 downto 0) when (mport_miso_rd_en_d1 = '1') else mport_mosi_rd_data(31 downto 16);
+
+
+	process (i_clk)
+	begin
+		if rising_edge(i_clk) then
+			-- Get new frame offset address when there is a new line
+			if ( i_line_start = '1' ) then
+				case i_frame_number is
+					when 0 =>
+						f_addr <= i_frame_addr0;
+					when 1 =>
+						f_addr <= i_frame_addr1;
+					when 2 =>
+						f_addr <= i_frame_addr2;
+					when 3 =>
+						f_addr <= i_frame_addr3;
+				end case;
+			end if;
+		end if;
+	end process;
+
+end Behavioral;
+
